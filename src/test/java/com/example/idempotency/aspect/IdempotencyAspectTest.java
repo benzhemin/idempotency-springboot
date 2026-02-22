@@ -7,6 +7,8 @@ import com.example.idempotency.model.CachedResponse;
 import com.example.idempotency.store.IdempotencyStore;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.aspectj.lang.ProceedingJoinPoint;
+import org.aspectj.lang.reflect.MethodSignature;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -14,9 +16,13 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.ResponseEntity;
 import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
 
+import java.lang.annotation.Annotation;
+import java.lang.reflect.Method;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
@@ -31,6 +37,7 @@ class IdempotencyAspectTest {
     @Mock private IdempotencyStore store;
     @Mock private ProceedingJoinPoint joinPoint;
     @Mock private Idempotent idempotent;
+    @Mock private MethodSignature methodSignature;
 
     private IdempotencyAspect aspect;
     private ObjectMapper objectMapper;
@@ -41,20 +48,33 @@ class IdempotencyAspectTest {
         aspect = new IdempotencyAspect(store, objectMapper);
     }
 
-    private void setUpRequest(String headerName, String headerValue, String body) {
+    @AfterEach
+    void tearDown() {
+        RequestContextHolder.resetRequestAttributes();
+    }
+
+    private void setUpRequest(String headerName, String headerValue) {
         MockHttpServletRequest request = new MockHttpServletRequest();
         if (headerValue != null) {
             request.addHeader(headerName, headerValue);
         }
-        if (body != null) {
-            request.setContent(body.getBytes());
-        }
         RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+    }
+
+    // Dummy method used to supply @RequestBody parameter annotations to the mock MethodSignature
+    @SuppressWarnings("unused")
+    public void dummyEndpoint(@RequestBody Map<String, Object> body) {}
+
+    private void setUpJoinPointWithBody(Object bodyArg) throws NoSuchMethodException {
+        Method dummyMethod = this.getClass().getMethod("dummyEndpoint", Map.class);
+        when(joinPoint.getSignature()).thenReturn(methodSignature);
+        when(methodSignature.getMethod()).thenReturn(dummyMethod);
+        when(joinPoint.getArgs()).thenReturn(new Object[]{bodyArg});
     }
 
     @Test
     void shouldThrowWhenMandatoryHeaderMissing() {
-        setUpRequest("Idempotency-Key", null, null);
+        setUpRequest("Idempotency-Key", null);
         when(idempotent.headerName()).thenReturn("Idempotency-Key");
         when(idempotent.mandatory()).thenReturn(true);
 
@@ -64,7 +84,7 @@ class IdempotencyAspectTest {
 
     @Test
     void shouldProceedWhenNonMandatoryHeaderMissing() throws Throwable {
-        setUpRequest("Idempotency-Key", null, null);
+        setUpRequest("Idempotency-Key", null);
         when(idempotent.headerName()).thenReturn("Idempotency-Key");
         when(idempotent.mandatory()).thenReturn(false);
         ResponseEntity<String> expected = ResponseEntity.ok("result");
@@ -78,7 +98,7 @@ class IdempotencyAspectTest {
 
     @Test
     void shouldReturnCachedResponseOnHit() throws Throwable {
-        setUpRequest("Idempotency-Key", "key-123", null);
+        setUpRequest("Idempotency-Key", "key-123");
         when(idempotent.headerName()).thenReturn("Idempotency-Key");
         when(idempotent.keyPrefix()).thenReturn("orders");
         when(idempotent.includeBody()).thenReturn(false);
@@ -96,7 +116,7 @@ class IdempotencyAspectTest {
 
     @Test
     void shouldProceedAndCacheOnMiss() throws Throwable {
-        setUpRequest("Idempotency-Key", "key-456", null);
+        setUpRequest("Idempotency-Key", "key-456");
         when(idempotent.headerName()).thenReturn("Idempotency-Key");
         when(idempotent.keyPrefix()).thenReturn("orders");
         when(idempotent.includeBody()).thenReturn(false);
@@ -115,7 +135,7 @@ class IdempotencyAspectTest {
 
     @Test
     void shouldNotCacheNon2xxResponses() throws Throwable {
-        setUpRequest("Idempotency-Key", "key-789", null);
+        setUpRequest("Idempotency-Key", "key-789");
         when(idempotent.headerName()).thenReturn("Idempotency-Key");
         when(idempotent.keyPrefix()).thenReturn("");
         when(idempotent.includeBody()).thenReturn(false);
@@ -132,15 +152,43 @@ class IdempotencyAspectTest {
 
     @Test
     void shouldThrowOnBodyMismatch() throws Throwable {
-        setUpRequest("Idempotency-Key", "key-abc", "{\"amount\":100}");
+        setUpRequest("Idempotency-Key", "key-abc");
         when(idempotent.headerName()).thenReturn("Idempotency-Key");
         when(idempotent.keyPrefix()).thenReturn("pay");
         when(idempotent.includeBody()).thenReturn(true);
 
+        // Set up joinPoint to return a parsed @RequestBody argument
+        Map<String, Object> requestBody = Map.of("amount", 100);
+        setUpJoinPointWithBody(requestBody);
+
+        // Cached response has a different body hash
         CachedResponse cached = new CachedResponse(200, "{}", "different-hash");
         when(store.get("idempotency:pay:key-abc")).thenReturn(Optional.of(cached));
 
         assertThatThrownBy(() -> aspect.handleIdempotency(joinPoint, idempotent))
                 .isInstanceOf(IdempotencyBodyMismatchException.class);
+    }
+
+    @Test
+    void shouldCacheBodyHashWhenIncludeBodyEnabled() throws Throwable {
+        setUpRequest("Idempotency-Key", "key-body-1");
+        when(idempotent.headerName()).thenReturn("Idempotency-Key");
+        when(idempotent.keyPrefix()).thenReturn("orders");
+        when(idempotent.includeBody()).thenReturn(true);
+        when(idempotent.ttl()).thenReturn(1L);
+        when(idempotent.timeUnit()).thenReturn(TimeUnit.HOURS);
+
+        Map<String, Object> requestBody = Map.of("item", "widget");
+        setUpJoinPointWithBody(requestBody);
+
+        when(store.get("idempotency:orders:key-body-1")).thenReturn(Optional.empty());
+        ResponseEntity<Map<String, Object>> controllerResponse = ResponseEntity.ok(Map.of("id", 1));
+        when(joinPoint.proceed()).thenReturn(controllerResponse);
+
+        aspect.handleIdempotency(joinPoint, idempotent);
+
+        verify(store).put(eq("idempotency:orders:key-body-1"),
+                argThat(cached -> cached.getBodyHash() != null && !cached.getBodyHash().isEmpty()),
+                eq(1L), eq(TimeUnit.HOURS));
     }
 }
