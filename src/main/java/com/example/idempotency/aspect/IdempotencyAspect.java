@@ -87,7 +87,7 @@ public class IdempotencyAspect {
         // Step 2: Try to acquire lock (atomic SET NX) before proceeding
         boolean lockAcquired;
         try {
-            lockAcquired = store.tryLock(redisKey, 30, java.util.concurrent.TimeUnit.SECONDS);
+            lockAcquired = store.tryLock(redisKey, idempotent.ttl(), idempotent.timeUnit());
         } catch (Exception e) {
             log.warn("Redis unavailable for idempotency lock, proceeding without: {}", e.getMessage());
             return joinPoint.proceed();
@@ -99,23 +99,32 @@ public class IdempotencyAspect {
         }
 
         // Step 3: Lock acquired — proceed with controller method
-        Object result = joinPoint.proceed();
+        // Step 4: Always release lock in finally (success, failure, or exception)
+        try {
+            Object result = joinPoint.proceed();
 
-        // Step 4: Cache only 2xx ResponseEntity results
-        if (result instanceof ResponseEntity<?> responseEntity) {
-            HttpStatusCode status = responseEntity.getStatusCode();
-            if (status.is2xxSuccessful()) {
-                try {
-                    String body = objectMapper.writeValueAsString(responseEntity.getBody());
-                    CachedResponse toCache = new CachedResponse(status.value(), body, bodyHash);
-                    store.put(redisKey, toCache, idempotent.ttl(), idempotent.timeUnit());
-                } catch (Exception e) {
-                    log.warn("Failed to cache idempotency response: {}", e.getMessage());
+            // Cache only 2xx ResponseEntity results
+            if (result instanceof ResponseEntity<?> responseEntity) {
+                HttpStatusCode status = responseEntity.getStatusCode();
+                if (status.is2xxSuccessful()) {
+                    try {
+                        String body = objectMapper.writeValueAsString(responseEntity.getBody());
+                        CachedResponse toCache = new CachedResponse(status.value(), body, bodyHash);
+                        store.put(redisKey, toCache, idempotent.ttl(), idempotent.timeUnit());
+                    } catch (Exception e) {
+                        log.warn("Failed to cache idempotency response: {}", e.getMessage());
+                    }
                 }
             }
-        }
 
-        return result;
+            return result;
+        } finally {
+            try {
+                store.unlock(redisKey);
+            } catch (Exception e) {
+                log.warn("Failed to release idempotency lock: {}", e.getMessage());
+            }
+        }
     }
 
     private String buildKey(String prefix, String headerValue) {

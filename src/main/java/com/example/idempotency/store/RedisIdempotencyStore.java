@@ -47,4 +47,10 @@ public class RedisIdempotencyStore implements IdempotencyStore {
         Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, "PROCESSING", lockTtl, timeUnit);
         return Boolean.TRUE.equals(acquired);
     }
+
+    @Override
+    public void unlock(String key) {
+        String lockKey = key + ":lock";
+        redisTemplate.delete(lockKey);
+    }
 }
