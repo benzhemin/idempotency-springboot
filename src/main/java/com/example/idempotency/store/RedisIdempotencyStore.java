@@ -40,4 +40,11 @@ public class RedisIdempotencyStore implements IdempotencyStore {
             throw new RuntimeException("Failed to serialize CachedResponse", e);
         }
     }
+
+    @Override
+    public boolean tryLock(String key, long lockTtl, TimeUnit timeUnit) {
+        String lockKey = key + ":lock";
+        Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, "PROCESSING", lockTtl, timeUnit);
+        return Boolean.TRUE.equals(acquired);
+    }
 }

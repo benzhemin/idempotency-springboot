@@ -2,6 +2,7 @@ package com.example.idempotency.aspect;
 
 import com.example.idempotency.annotation.Idempotent;
 import com.example.idempotency.exception.IdempotencyBodyMismatchException;
+import com.example.idempotency.exception.IdempotencyConflictException;
 import com.example.idempotency.exception.IdempotencyKeyMissingException;
 import com.example.idempotency.model.CachedResponse;
 import com.example.idempotency.store.IdempotencyStore;
@@ -58,7 +59,7 @@ public class IdempotencyAspect {
         String redisKey = buildKey(idempotent.keyPrefix(), headerValue);
         String bodyHash = idempotent.includeBody() ? hashRequestBody(joinPoint) : null;
 
-        // Check cache
+        // Step 1: Check if response is already cached (completed previous request)
         Optional<CachedResponse> cached;
         try {
             cached = store.get(redisKey);
@@ -83,10 +84,24 @@ public class IdempotencyAspect {
                     .body(cachedResponse.getBody());
         }
 
-        // Cache miss — proceed
+        // Step 2: Try to acquire lock (atomic SET NX) before proceeding
+        boolean lockAcquired;
+        try {
+            lockAcquired = store.tryLock(redisKey, 30, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.warn("Redis unavailable for idempotency lock, proceeding without: {}", e.getMessage());
+            return joinPoint.proceed();
+        }
+
+        if (!lockAcquired) {
+            // Another request with the same key is currently being processed
+            throw new IdempotencyConflictException(headerValue);
+        }
+
+        // Step 3: Lock acquired — proceed with controller method
         Object result = joinPoint.proceed();
 
-        // Cache only 2xx ResponseEntity results
+        // Step 4: Cache only 2xx ResponseEntity results
         if (result instanceof ResponseEntity<?> responseEntity) {
             HttpStatusCode status = responseEntity.getStatusCode();
             if (status.is2xxSuccessful()) {

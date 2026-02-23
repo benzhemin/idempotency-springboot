@@ -8,4 +8,5 @@ import java.util.concurrent.TimeUnit;
 public interface IdempotencyStore {
     Optional<CachedResponse> get(String key);
     void put(String key, CachedResponse response, long ttl, TimeUnit timeUnit);
+    boolean tryLock(String key, long lockTtl, TimeUnit timeUnit);
 }

@@ -2,6 +2,7 @@ package com.example.idempotency.aspect;
 
 import com.example.idempotency.annotation.Idempotent;
 import com.example.idempotency.exception.IdempotencyBodyMismatchException;
+import com.example.idempotency.exception.IdempotencyConflictException;
 import com.example.idempotency.exception.IdempotencyKeyMissingException;
 import com.example.idempotency.model.CachedResponse;
 import com.example.idempotency.store.IdempotencyStore;
@@ -124,12 +125,14 @@ class IdempotencyAspectTest {
         when(idempotent.timeUnit()).thenReturn(TimeUnit.HOURS);
 
         when(store.get("idempotency:orders:key-456")).thenReturn(Optional.empty());
+        when(store.tryLock(eq("idempotency:orders:key-456"), eq(30L), eq(TimeUnit.SECONDS))).thenReturn(true);
         ResponseEntity<String> controllerResponse = ResponseEntity.status(201).body("{\"id\":2}");
         when(joinPoint.proceed()).thenReturn(controllerResponse);
 
         Object result = aspect.handleIdempotency(joinPoint, idempotent);
 
         assertThat(result).isEqualTo(controllerResponse);
+        verify(store).tryLock("idempotency:orders:key-456", 30L, TimeUnit.SECONDS);
         verify(store).put(eq("idempotency:orders:key-456"), any(CachedResponse.class), eq(1L), eq(TimeUnit.HOURS));
     }
 
@@ -141,6 +144,7 @@ class IdempotencyAspectTest {
         when(idempotent.includeBody()).thenReturn(false);
 
         when(store.get("idempotency::key-789")).thenReturn(Optional.empty());
+        when(store.tryLock(eq("idempotency::key-789"), eq(30L), eq(TimeUnit.SECONDS))).thenReturn(true);
         ResponseEntity<String> errorResponse = ResponseEntity.badRequest().body("error");
         when(joinPoint.proceed()).thenReturn(errorResponse);
 
@@ -182,6 +186,7 @@ class IdempotencyAspectTest {
         setUpJoinPointWithBody(requestBody);
 
         when(store.get("idempotency:orders:key-body-1")).thenReturn(Optional.empty());
+        when(store.tryLock(eq("idempotency:orders:key-body-1"), eq(30L), eq(TimeUnit.SECONDS))).thenReturn(true);
         ResponseEntity<Map<String, Object>> controllerResponse = ResponseEntity.ok(Map.of("id", 1));
         when(joinPoint.proceed()).thenReturn(controllerResponse);
 
@@ -190,5 +195,21 @@ class IdempotencyAspectTest {
         verify(store).put(eq("idempotency:orders:key-body-1"),
                 argThat(cached -> cached.getBodyHash() != null && !cached.getBodyHash().isEmpty()),
                 eq(1L), eq(TimeUnit.HOURS));
+    }
+
+    @Test
+    void shouldReturn409WhenLockNotAcquired() throws Throwable {
+        setUpRequest("Idempotency-Key", "key-conflict");
+        when(idempotent.headerName()).thenReturn("Idempotency-Key");
+        when(idempotent.keyPrefix()).thenReturn("orders");
+        when(idempotent.includeBody()).thenReturn(false);
+
+        when(store.get("idempotency:orders:key-conflict")).thenReturn(Optional.empty());
+        when(store.tryLock(eq("idempotency:orders:key-conflict"), eq(30L), eq(TimeUnit.SECONDS))).thenReturn(false);
+
+        assertThatThrownBy(() -> aspect.handleIdempotency(joinPoint, idempotent))
+                .isInstanceOf(IdempotencyConflictException.class);
+
+        verify(joinPoint, never()).proceed();
     }
 }
